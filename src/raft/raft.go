@@ -20,10 +20,34 @@ package raft
 import "sync"
 import "labrpc"
 
-// import "bytes"
-// import "encoding/gob"
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"math/rand"
+	"time"
+)
 
+// interface{}: empty interface, interface{} 类型是没有方法的接口,所有类型都实现了空接口
+//              这里我认为是command可标识为read/write，值与寄存器的类型也可变，所以不用具体类型表示，(或者可以用string做字符串解析？)
+/*	names := []string{"stanley", "david", "oscar"}
+    vals := make([]interface{}, len(names))
+    for i, v := range names {
+        vals[i] = v
+    }*/
+// 函数名前的括号: 接收者,加*可修改接收器,不加则修改无效
+/*	func (m *Mutatable) Mutate() {
+    	m.a = 5
+    	m.b = 7
+	}
+    m := &Mutatable{0, 0} m.Mutate()
+*/
 
+const FOLLOWER_STATE int = 0
+const CANDIDATE_STATE int = 1
+const LEADER_STATE int = 2
+const HeartbeatPeriod = 70.0 * time.Millisecond
+const ElectionTimeBase = 300.0 * time.Millisecond
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -37,9 +61,19 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type logEntry struct{
+	Index 	int
+	Term 	int
+	Command interface{}
+}
 //
 // A Go object implementing a single Raft peer.
 //
+/*type Persister struct {
+	mu        sync.Mutex
+	raftstate []byte
+	snapshot  []byte
+}*/
 type Raft struct {
 	mu        sync.Mutex
 	peers     []*labrpc.ClientEnd
@@ -49,7 +83,28 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state  	int   // the state of server (follower/candidate/leader)
 
+	// persistent state on all servers , Updated on stable storage before responding to RPCs
+	currentTerm		int   // latest term server has seen (initialized to -1)
+	votedFor		int	  // candidateId that received vote in current term(initialized to -1)
+	log				[]logEntry
+
+	// volatile state on all servers
+	commitIndex		int   // index of highest log entry known to be committed (initialized to -1)
+	lastApplied		int   // index of highest log entry applied to state machine (initialized to -1)
+
+	// volatile state on leaders , reinitialized after election
+	nextIndex		[]int // index of the next log entry to send to some server (initialized to leader last log index+1)
+	matchIndex		[]int // index of highest log entry known to be replicated on server
+
+	// timers of heartbeat and election timeout
+	heartbeatTimeOut	int
+	electionTimeOut		int
+	timer 				*time.Timer
+
+	applyChannel chan ApplyMsg //a channel on which the tester or service expects Raft to send ApplyMsg messages.
+	alive	     chan int      // if alive then 1, killed than 0
 }
 
 // return currentTerm and whether this server
@@ -69,25 +124,30 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here.
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	// because there exists lock in RequestVote, there is no need to lock
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.electionTimeOut)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
-//
+// 恢复机制,很显然需要和persist()有相同的存储和读取方式保证对应数据一致
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here.
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.electionTimeOut)
+	d.Decode(&rf.log)
 }
 
 
@@ -98,6 +158,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
+	Term			int  // candidate's term
+	CandidateId 	int	 // candidate requesting vote
+	LastLogIndex	int  // index of candidate's last log entry
+	LastLogTerm		int	 // term of candidate's last log entry
 }
 
 //
@@ -105,6 +169,23 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+	Term			int  // currentTerm, for candidate to update itself
+	VoteGranted		bool // true means candidate received vote
+}
+
+type AppendEntriesArgs struct {
+
+}
+
+type AppendEntriesReply struct {
+
+}
+
+func (rf *Raft) ResetTimer(){
+	rf.mu.Lock()
+	fmt.Println("Server ",rf.me,": Reset timer.")
+	defer rf.mu.Unlock()
+	rf.timer.Reset(time.Duration(rf.electionTimeOut)*time.Millisecond)
 }
 
 //
@@ -112,6 +193,26 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	//var readyVote bool = true
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	} else if args.Term > rf.currentTerm{
+		// change state to become a follower
+		rf.state = FOLLOWER_STATE
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		reply.Term = args.Term
+	} else{
+		reply.Term = rf.currentTerm
+		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+			reply.VoteGranted = false
+		}
+	}
 }
 
 //
@@ -136,6 +237,10 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *RequestVoteReply) bool{
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
