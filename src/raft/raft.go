@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
-	"math/rand"
 	"time"
 )
 
@@ -196,7 +195,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	//var readyVote bool = true
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -207,11 +205,29 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		reply.Term = args.Term
+		reply.VoteGranted = true
 	} else{
 		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
 		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 			reply.VoteGranted = false
 		}
+	}
+	if reply.VoteGranted == true {
+		// the log of candidate should be more up-to-date
+		var idx int = len(rf.log)-1
+		if idx>=0 {
+			if args.LastLogTerm > rf.log[idx].Term ||
+				(args.LastLogTerm == rf.log[idx].Term && args.LastLogIndex >= rf.log[idx].Index) {
+				reply.VoteGranted = true
+			} else {
+				reply.VoteGranted = false
+			}
+		}
+	}
+	if reply.VoteGranted == true {
+		rf.votedFor = args.CandidateId
+		rf.ResetTimer() // new term, refresh time of election
 	}
 }
 
