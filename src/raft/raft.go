@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"math/rand"
 	"time"
 )
 
@@ -45,8 +46,8 @@ import (
 const FOLLOWER_STATE int = 0
 const CANDIDATE_STATE int = 1
 const LEADER_STATE int = 2
-const HeartbeatPeriod = 70.0 * time.Millisecond
-const ElectionTimeBase = 300.0 * time.Millisecond
+const HeartbeatPeriod = 100
+const ElectionTimeBase = 300
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -96,15 +97,15 @@ type Raft struct {
 	// volatile state on leaders , reinitialized after election
 	nextIndex		[]int // index of the next log entry to send to some server (initialized to leader last log index+1)
 	matchIndex		[]int // index of highest log entry known to be replicated on server
+	heartbeatTimer	*time.Timer
 
 	// timers of heartbeat and election timeout
 	heartbeatTimeOut	int
 	electionTimeOut		int
-	heartbeatTimer		*time.Timer
 	electionTimer 		*time.Timer
 
 	applyChannel chan ApplyMsg //a channel on which the tester or service expects Raft to send ApplyMsg messages.
-	alive	     chan int      // if alive then 1, killed than 0
+	killed	     chan int      // if alive then 0, killed than 1
 }
 
 // return currentTerm and whether this server
@@ -125,6 +126,8 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here.
 	// because there exists lock in RequestVote, there is no need to lock
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -150,9 +153,6 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.log)
 }
 
-//
-// example RequestVote RPC arguments structure.
-//
 type RequestVoteArgs struct {
 	// Your data here.
 	Term			int  // candidate's term
@@ -161,9 +161,6 @@ type RequestVoteArgs struct {
 	LastLogTerm		int	 // term of candidate's last log entry
 }
 
-//
-// example RequestVote RPC reply structure.
-//
 type RequestVoteReply struct {
 	// Your data here.
 	Term			int  // currentTerm, for candidate to update itself
@@ -181,12 +178,20 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	Term			int  // currentTerm, for leader to update itself
-	Success			bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Success			bool // false if term stale
+	Contain			bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	NextTestIndex	int
+}
 
+func Min(x, y int) int {
+	if x<y {
+		return x
+	}
+	return y
 }
 
 func (rf *Raft) ResetElectionTimer(){
-	//rf.mu.Lock()
+	//rf.mu.Lock() // one operation is atomic and does not need to add lock
 	//defer rf.mu.Unlock()
 	rf.electionTimer.Reset(time.Duration(rf.electionTimeOut)*time.Millisecond)
 }
@@ -197,8 +202,8 @@ func (rf *Raft) ResetElectionTimer(){
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer rf.persist()
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -240,7 +245,63 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply){
+	rf.mu.Lock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		rf.mu.Unlock()
+		return
+	}
+	reply.Success = true
+	reply.Term = args.Term
+	rf.ResetElectionTimer()
+	if args.Term > rf.currentTerm {
+		rf.state = FOLLOWER_STATE
+		rf.currentTerm = args.Term
+	} else {
+		if rf.state == LEADER_STATE {
+			fmt.Println("It is impossible!!! There are two leaders in the same term! ")
+		}
+	}
+	if args.PrevLogIndex < 0 {
+		reply.Contain = true
+		reply.NextTestIndex = -1
+	} else if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Contain = false
+		var targetIndex int = Min(args.PrevLogIndex-1,len(rf.log)-1)
+		for targetIndex >= 0 && rf.log[targetIndex].Term > args.PrevLogTerm {
+			targetIndex--
+		}
+		reply.NextTestIndex = targetIndex
+	} else {
+		reply.Contain = true
+		reply.NextTestIndex = args.PrevLogIndex + 1
+	}
+	if len(args.Entries) == 0 {  // heartbeat
+		// have reset election timer
+	} else {                    // normal AppendEntries RPC
 
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = Min(args.LeaderCommit, len(rf.log)-1)
+	}
+	if rf.commitIndex > rf.lastApplied {
+		for i:= rf.lastApplied+1; i<= rf.commitIndex; i++ {
+			var msg ApplyMsg
+			msg.Index = i
+			msg.Command = rf.log[i].Command
+			rf.applyChannel <- msg
+		}
+		rf.lastApplied = rf.commitIndex
+	}
+	rf.mu.Unlock()
+	rf.persist()
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me,": Receive AppendEntries from server(leader) ",args.LeaderId)
+	if len(args.Entries) == 0{
+		fmt.Println("The AppendEntries RPC is heartbeat")
+	}
+	fmt.Println("======================================================")
 }
 //
 // example code to send a RequestVote RPC to a server.
@@ -288,8 +349,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	defer rf.persist()	// because there exists lock in persist(), so it should not be lock()-> lock()-> unlock()-> unlock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 	return index, term, isLeader
 }
 
@@ -301,7 +362,32 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	rf.alive <- 0
+	rf.killed <- 1
+}
+
+func (rf *Raft) Loop() {
+	rf.ResetElectionTimer()
+	for {
+		select {
+		case <-rf.electionTimer.C:
+			switch rf.state{
+			case FOLLOWER_STATE:
+			case CANDIDATE_STATE:
+			case LEADER_STATE:
+			}
+		case <-rf.heartbeatTimer.C:
+			switch rf.state{
+			case FOLLOWER_STATE:
+			case CANDIDATE_STATE:
+			case LEADER_STATE:
+			}
+		case <-rf.killed:
+			fmt.Println("Server ",rf.me," has crashed.")
+			return
+		default:
+
+		}
+	}
 }
 
 //
@@ -324,11 +410,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// step1. initialize each variables of server node
 	// step2. create a go routine to judge whether start election
 	// step3. if step2 passes, then become a leader and send heartbeat and AppendEntriesRPC
+	// step4. if crash, end; if lose leadership, goto 2
 	// Your initialization code here.
+	rf.state = FOLLOWER_STATE
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	if persister.ReadRaftState() != nil {
+		rf.readPersist(persister.ReadRaftState())
+	} else {
+		rf.currentTerm = -1
+		rf.votedFor = -1
+		rf.log = []logEntry{}
+		rf.electionTimeOut = rand.Int()%ElectionTimeBase + ElectionTimeBase
+	}
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.heartbeatTimeOut = HeartbeatPeriod
+	rf.electionTimer = time.NewTimer(time.Duration(rf.electionTimeOut)*time.Millisecond)
+	rf.applyChannel = applyCh
+	rf.killed = make(chan int)
 
+	go rf.Loop()
 
 	return rf
 }
