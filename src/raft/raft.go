@@ -100,7 +100,8 @@ type Raft struct {
 	// timers of heartbeat and election timeout
 	heartbeatTimeOut	int
 	electionTimeOut		int
-	timer 				*time.Timer
+	heartbeatTimer		*time.Timer
+	electionTimer 		*time.Timer
 
 	applyChannel chan ApplyMsg //a channel on which the tester or service expects Raft to send ApplyMsg messages.
 	alive	     chan int      // if alive then 1, killed than 0
@@ -149,9 +150,6 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.log)
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 //
@@ -173,18 +171,24 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-
+	Term			int  // leader's term
+	LeaderId		int	 // so follower can redirect clients
+	PrevLogIndex	int	 // index of log entry immediately preceding new ones
+	PrevLogTerm		int  // term of prevLogIndex entry
+	Entries 		[]logEntry  // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit	int  // leader's commitIndex
 }
 
 type AppendEntriesReply struct {
+	Term			int  // currentTerm, for leader to update itself
+	Success			bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 
 }
 
-func (rf *Raft) ResetTimer(){
-	rf.mu.Lock()
-	fmt.Println("Server ",rf.me,": Reset timer.")
-	defer rf.mu.Unlock()
-	rf.timer.Reset(time.Duration(rf.electionTimeOut)*time.Millisecond)
+func (rf *Raft) ResetElectionTimer(){
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	rf.electionTimer.Reset(time.Duration(rf.electionTimeOut)*time.Millisecond)
 }
 
 //
@@ -227,10 +231,17 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if reply.VoteGranted == true {
 		rf.votedFor = args.CandidateId
-		rf.ResetTimer() // new term, refresh time of election
+		rf.ResetElectionTimer() // new term, reset time of election
 	}
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me,": Receive RequestVote from server ",args.CandidateId)
+	fmt.Println("before this, votedFor:",rf.votedFor," so result:",reply.VoteGranted)
+	fmt.Println("======================================================")
 }
 
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply){
+
+}
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -253,7 +264,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *RequestVoteReply) bool{
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool{
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -272,11 +283,13 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *Req
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
 	index := -1
 	term := -1
 	isLeader := true
 
-
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	return index, term, isLeader
 }
 
@@ -288,6 +301,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.alive <- 0
 }
 
 //
@@ -307,7 +321,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	// step1. initialize each variables of server node
+	// step2. create a go routine to judge whether start election
+	// step3. if step2 passes, then become a leader and send heartbeat and AppendEntriesRPC
 	// Your initialization code here.
 
 	// initialize from state persisted before a crash
