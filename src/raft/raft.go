@@ -43,6 +43,11 @@ import (
     m := &Mutatable{0, 0} m.Mutate()
 */
 
+/*
+第一次测试: 卡在TestReElection，错误原因：server2 断连后，server0与server1循环选举，并判断到对方的term更大而转为follower，从此往复
+	找到原因：在StartElection中，if reply.Term > rf.currentTerm 写成了 rf.me
+*/
+
 const FOLLOWER_STATE int = 0
 const CANDIDATE_STATE int = 1
 const LEADER_STATE int = 2
@@ -115,6 +120,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here.
+	term = rf.currentTerm
+	isleader = rf.state == LEADER_STATE
 	return term, isleader
 }
 
@@ -126,6 +133,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here.
 	// because there exists lock in RequestVote, there is no need to lock
+	// But I change the location to move persist() out of mu.lock()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	w := new(bytes.Buffer)
@@ -195,6 +203,11 @@ func (rf *Raft) ResetElectionTimer(){
 	//defer rf.mu.Unlock()
 	rf.electionTimer.Reset(time.Duration(rf.electionTimeOut)*time.Millisecond)
 }
+func (rf *Raft) ResetHeartbeatTimer(){
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	rf.heartbeatTimer.Reset(time.Duration(rf.heartbeatTimeOut)*time.Millisecond)
+}
 
 //
 // example RequestVote RPC handler.
@@ -218,14 +231,14 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	} else{
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		if (rf.votedFor != -1 && rf.votedFor != args.CandidateId) || rf.state == LEADER_STATE {
 			reply.VoteGranted = false
 		}
 	}
 	if reply.VoteGranted == true {
 		// the log of candidate should be more up-to-date
 		var idx int = len(rf.log)-1
-		if idx>=0 {
+		if idx >= 0 {
 			if args.LastLogTerm > rf.log[idx].Term ||
 				(args.LastLogTerm == rf.log[idx].Term && args.LastLogIndex >= rf.log[idx].Index) {
 				reply.VoteGranted = true
@@ -240,7 +253,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	fmt.Println("======================================================")
 	fmt.Println("Server ",rf.me,": Receive RequestVote from server ",args.CandidateId)
-	fmt.Println("before this, votedFor:",rf.votedFor," so result:",reply.VoteGranted)
+	fmt.Println("before this, votedFor:",rf.votedFor," ,currentTerm:",rf.currentTerm," so result:",reply.VoteGranted)
 	fmt.Println("======================================================")
 }
 
@@ -261,6 +274,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	} else {
 		if rf.state == LEADER_STATE {
 			fmt.Println("It is impossible!!! There are two leaders in the same term! ")
+		} else if rf.state == CANDIDATE_STATE {
+			rf.state = FOLLOWER_STATE
 		}
 	}
 	if args.PrevLogIndex < 0 {
@@ -294,14 +309,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		}
 		rf.lastApplied = rf.commitIndex
 	}
-	rf.mu.Unlock()
-	rf.persist()
 	fmt.Println("======================================================")
 	fmt.Println("Server ",rf.me,": Receive AppendEntries from server(leader) ",args.LeaderId)
-	if len(args.Entries) == 0{
+	if len(args.Entries) == 0 {
 		fmt.Println("The AppendEntries RPC is heartbeat")
 	}
 	fmt.Println("======================================================")
+	rf.mu.Unlock()
+	rf.persist()
 }
 //
 // example code to send a RequestVote RPC to a server.
@@ -349,8 +364,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	defer rf.persist()	// because there exists lock in persist(), so it should not be lock()-> lock()-> unlock()-> unlock()
-	defer rf.mu.Unlock()
+	rf.mu.Unlock()
+	rf.persist()	// because there exists lock in persist(), so it should not be lock()-> lock()-> unlock()-> unlock()
 	return index, term, isLeader
 }
 
@@ -365,21 +380,202 @@ func (rf *Raft) Kill() {
 	rf.killed <- 1
 }
 
+func (rf *Raft)StartElection() {
+	// times out, starts election
+	rf.mu.Lock()
+	rf.state = CANDIDATE_STATE
+	rf.currentTerm = rf.currentTerm + 1
+	rf.votedFor = rf.me
+	rf.ResetElectionTimer()
+	var lli, llt, le int = -1, -1, len(rf.log)
+	if le > 0 {
+		lli = rf.log[le-1].Index
+		llt = rf.log[le-1].Term
+	}
+	var args RequestVoteArgs
+	args.Term = rf.currentTerm
+	args.CandidateId = rf.me
+	args.LastLogIndex = lli
+	args.LastLogTerm = llt
+	rf.mu.Unlock()
+
+	replyCh := make(chan *RequestVoteReply, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		// there is no lock, so the server may receive RequestVote or AppendEntries anytime and may turn to follower
+		if rf.state == FOLLOWER_STATE {
+			break
+		}
+		go rf.ReadyToSendRequestVote(i, args, replyCh)
+	}
+	if rf.state == FOLLOWER_STATE {
+		fmt.Println("1")
+		rf.ResetElectionTimer()
+		return // if not func, change to 'break'
+	}
+	//理论上在timeout后这里应该在下一个candidate里处理，这里保留后续可做优化
+	time.Sleep(time.Duration(rf.electionTimeOut-rf.heartbeatTimeOut) * time.Millisecond)
+	close(replyCh)
+
+	rf.mu.Lock()
+	var voteNum, total int = 1, len(rf.peers)
+	for reply := range replyCh {
+		if reply.Term > rf.currentTerm { // because the decision if rf.state == FOLLOWER_STATE before, here rf.currentTerm == args.Term
+			rf.state = FOLLOWER_STATE
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+		} else {
+			if reply.VoteGranted == true {
+				voteNum = voteNum + 1
+			}
+		}
+	}
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me," state:",rf.state,", voteNum:",voteNum,", total:",total)
+	if rf.state == FOLLOWER_STATE {
+		rf.ResetElectionTimer()
+		fmt.Println("Turn to follower.")
+		fmt.Println("======================================================")
+	} else if voteNum >= total/2+1 {
+		rf.state = LEADER_STATE
+		// rf.BecomeLeader()
+	} else { // times out, new election
+		rf.state = CANDIDATE_STATE
+		rf.electionTimeOut = rand.Int()%ElectionTimeBase + ElectionTimeBase
+		rf.ResetElectionTimer()
+		fmt.Println("Server ",rf.me," times out, starts new election, new electionThreld:",rf.electionTimeOut)
+		fmt.Println("======================================================")
+	}
+	rf.mu.Unlock()
+	rf.persist()
+}
+
+func (rf *Raft)ReadyToSendRequestVote(target int, args RequestVoteArgs, replyCh chan *RequestVoteReply) {
+	reply := &RequestVoteReply{}
+	timeout := time.NewTimer(time.Duration(rf.electionTimeOut - rf.heartbeatTimeOut)*time.Millisecond)
+	var received bool = false
+	for received == false {
+		select {
+		case <-timeout.C:
+			return
+		default:
+			received = rf.sendRequestVote(target, args, reply)
+		}
+	}
+	if received == true {
+		replyCh <- reply
+	}
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me,": Send RequestVote to server ",target, " currentTerm:",args.Term )
+	if received == true {
+		fmt.Println("The RequestVote RPC has been sent successfully.")
+	}
+	fmt.Println("======================================================")
+}
+
+func (rf *Raft)ReadyToSendAppendEntries(target int, args AppendEntriesArgs, replyCh chan *AppendEntriesReply) {
+	reply := &AppendEntriesReply{}
+	var received bool = false
+	received = rf.sendAppendEntries(target, args, reply)
+	if received == true {
+		replyCh <- reply
+	}
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me,": Send AppendEntries to server ",target)
+	if len(args.Entries) ==0 {
+		fmt.Println("This is a heartbeat.")
+	}
+	if received == true {
+		fmt.Println("The AppendEntries RPC has been sent successfully.")
+	}
+	fmt.Println("======================================================")
+}
+
+func (rf *Raft)BecomeLeader() {
+	rf.mu.Lock()
+	rf.state = LEADER_STATE
+	rf.votedFor = rf.me
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = -1
+	}
+	rf.ResetElectionTimer()
+	fmt.Println("======================================================")
+	fmt.Println("Server ",rf.me," has become a leader.")
+	fmt.Println("======================================================")
+	rf.mu.Unlock()
+}
+
+func (rf *Raft)LeaderSendHeartbeat() {
+	rf.mu.Lock()
+	var args AppendEntriesArgs
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.PrevLogIndex = -1
+	args.PrevLogTerm = -1
+	if len(rf.log) > 0 {
+		args.PrevLogIndex = rf.log[len(rf.log)-1].Index
+		args.PrevLogTerm = rf.log[len(rf.log)-1].Term
+	}
+	args.Entries = []logEntry{}
+	args.LeaderCommit = rf.commitIndex
+	rf.mu.Unlock()
+
+	replyCh := make(chan *AppendEntriesReply, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		// there is no lock, so the server may receive RequestVote or AppendEntries anytime and may turn to follower
+		if rf.state == FOLLOWER_STATE {
+			break
+		}
+		go rf.ReadyToSendAppendEntries(i, args, replyCh)
+	}
+	if rf.state == FOLLOWER_STATE {
+		rf.ResetElectionTimer()
+		return // if not func, change to 'break'
+	}
+
+	// there should be code to handle replys from followers
+	rf.mu.Lock()
+	rf.ResetHeartbeatTimer()
+
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) Loop() {
 	rf.ResetElectionTimer()
+	rf.ResetHeartbeatTimer()
 	for {
 		select {
 		case <-rf.electionTimer.C:
-			switch rf.state{
-			case FOLLOWER_STATE:
-			case CANDIDATE_STATE:
-			case LEADER_STATE:
+			rf.ResetElectionTimer()
+			var ifLeader_NewLeader bool = false
+			if rf.state == FOLLOWER_STATE {
+				// times out, starts election
+				ifLeader_NewLeader = true
+				rf.StartElection()
+			}else if rf.state == CANDIDATE_STATE { // there should not be 'else if',because rf may times out and start new election
+				ifLeader_NewLeader = true
+				rf.StartElection()
+			}
+			if ifLeader_NewLeader == true && rf.state == LEADER_STATE {
+				rf.BecomeLeader()
+				rf.LeaderSendHeartbeat()
 			}
 		case <-rf.heartbeatTimer.C:
-			switch rf.state{
+			switch rf.state {
 			case FOLLOWER_STATE:
+				rf.ResetHeartbeatTimer()
 			case CANDIDATE_STATE:
+				rf.ResetHeartbeatTimer()
 			case LEADER_STATE:
+				rf.LeaderSendHeartbeat()
 			}
 		case <-rf.killed:
 			fmt.Println("Server ",rf.me," has crashed.")
@@ -427,6 +623,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = -1
 	rf.heartbeatTimeOut = HeartbeatPeriod
 	rf.electionTimer = time.NewTimer(time.Duration(rf.electionTimeOut)*time.Millisecond)
+	rf.heartbeatTimer = time.NewTimer(time.Duration(rf.heartbeatTimeOut)*time.Millisecond)
 	rf.applyChannel = applyCh
 	rf.killed = make(chan int)
 
